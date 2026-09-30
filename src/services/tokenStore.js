@@ -7,27 +7,35 @@ const FILE = path.resolve(__dirname, "../../data/google-tokens.json");
 
 fs.mkdirSync(path.dirname(FILE), { recursive: true });
 
-export function readTokens() {
+function readFile() {
     try { return JSON.parse(fs.readFileSync(FILE, "utf8")); }
     catch { return null; }
 }
 
+export function readTokens() {
+    const t = readFile();
+    if (!t?.refresh_token && process.env.GOOGLE_REFRESH_TOKEN) {
+        return { ...t, refresh_token: process.env.GOOGLE_REFRESH_TOKEN };
+    }
+    return t;
+}
+
 export function writeTokens(tokens) {
-    fs.writeFileSync(FILE, JSON.stringify(tokens, null, 2));
+    const old = readFile() || {};
+    const merged = { ...old, ...tokens };
+    if (!tokens.refresh_token && old.refresh_token) merged.refresh_token = old.refresh_token;
+    if (!tokens.folderId && old.folderId) merged.folderId = old.folderId;
+    fs.writeFileSync(FILE, JSON.stringify(merged, null, 2));
 }
 
 export function clearTokens() {
     if (fs.existsSync(FILE)) fs.unlinkSync(FILE);
 }
 
-/* NEW — persist the studio root folder ID */
 export function writeRootFolderId(id) {
-    const t = readTokens() || {};
-    t.folderId = id;
-    writeTokens(t);
+    writeTokens({ folderId: id });
 }
 
 export function readRootFolderId() {
-    const t = readTokens();
-    return t?.folderId || null;
+    return readFile()?.folderId || process.env.GOOGLE_ROOT_FOLDER_ID || null;
 }

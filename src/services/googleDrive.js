@@ -66,7 +66,7 @@ export async function exchangeCode(code) {
 
 export function isConnected() {
     const t = readTokens();
-    return Boolean(t && (t.refresh_token || t.access_token));
+    return Boolean(t?.refresh_token);
 }
 
 export function getAccount() {
@@ -139,9 +139,11 @@ export async function setupStudioFolders() {
 
 /** Returns the folder IDs we need for design uploads. Auto-creates missing ones. */
 export async function getStudioFolders() {
-    const rootId = readRootFolderId();
-    if (!rootId) throw new Error("Studio not set up. Connect Google Drive first.");
-
+    let rootId = readRootFolderId();
+    if (!rootId) {
+        if (!isConnected()) throw new Error("Connect Google Drive first.");
+        ({ rootId } = await setupStudioFolders());
+    }
     const designsId = await ensureFolder("Mehndi-Designs", rootId);
     const dataId = await ensureFolder("Data", rootId);
     return { rootId, designsId, dataId };
