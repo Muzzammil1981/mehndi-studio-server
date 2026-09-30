@@ -1,0 +1,16 @@
+{
+  "designs": [
+    {
+      "id": "arabic-1-1790570583104",
+      "name": "Arabic 1",
+      "description": "Description",
+      "price": 1500,
+      "amountType": "per design",
+      "categoryId": "arabic",
+      "categoryName": "Arabic Mehndi",
+      "featured": true,
+      "image": "/uploads/arabic/1790570583095-images-1.jpg",
+      "createdAt": "2026-09-28T04:43:03.104Z"
+    }
+  ]
+}
