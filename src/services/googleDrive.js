@@ -53,7 +53,7 @@ export function getAuthUrl() {
 
 export async function exchangeCode(code) {
     const { tokens } = await oauth2Client.getToken(code);
-    console.log("REFRESH TOKEN:", tokens.refresh_token);
+    // console.log("REFRESH TOKEN:", tokens.refresh_token);
     oauth2Client.setCredentials(tokens);
     writeTokens(tokens);
 
