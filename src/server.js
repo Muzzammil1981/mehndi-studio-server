@@ -36,6 +36,11 @@ app.use("/api/google", googleRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/designs", designsRoutes);
 
+import { warmDesignImages } from "./routes/designs.js";
+// after server.listen(...)
+setTimeout(() => warmDesignImages().catch(() => {}), 2000);
+
+
 import usersRoutes from "./routes/users.js";
 app.use("/api/users", usersRoutes);
 

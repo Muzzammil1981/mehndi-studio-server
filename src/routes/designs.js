@@ -9,6 +9,69 @@ import { notifyUsers } from "../socket.js";
 
 const router = express.Router();
 
+
+/* ---------- image cache + concurrency limit ---------- */
+const IMG_MAX_BYTES = 100 * 1024 * 1024; // 100 MB
+const imgCache = new Map();              // id -> { buf, contentType, etag, fileId }
+const imgInflight = new Map();
+let imgBytes = 0;
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+let active = 0;
+const waiting = [];
+async function limit(fn, max = 4) {
+    if (active >= max) await new Promise(r => waiting.push(r));
+    active++;
+    try { return await fn(); }
+    finally { active--; waiting.shift()?.(); }
+}
+
+function remember(id, entry) {
+    const old = imgCache.get(id);
+    if (old) { imgBytes -= old.buf.length; imgCache.delete(id); }
+    imgCache.set(id, entry);
+    imgBytes += entry.buf.length;
+    for (const [k, v] of imgCache) {          // evict oldest first
+        if (imgBytes <= IMG_MAX_BYTES) break;
+        imgCache.delete(k); imgBytes -= v.buf.length;
+    }
+}
+
+async function getImage(design) {
+    const hit = imgCache.get(design.id);
+    if (hit && hit.fileId === design.driveFileId) return hit;
+    if (imgInflight.has(design.id)) return imgInflight.get(design.id);
+
+    const p = limit(async () => {
+        let lastErr;
+        for (let i = 0; i < 3; i++) {
+            try {
+                const { stream, contentType } = await getFileStream(design.driveFileId);
+                const chunks = [];
+                for await (const c of stream) chunks.push(c);
+                const buf = Buffer.concat(chunks);
+                const entry = {
+                    buf,
+                    fileId: design.driveFileId,
+                    contentType: contentType?.startsWith("image/") ? contentType : "image/jpeg",
+                    etag: `"${design.driveFileId}-${buf.length}"`,
+                };
+                remember(design.id, entry);
+                return entry;
+            } catch (err) {
+                lastErr = err;
+                if (err.code === 404) break;
+                await sleep(300 * (i + 1));
+            }
+        }
+        throw lastErr;
+    }).finally(() => imgInflight.delete(design.id));
+
+    imgInflight.set(design.id, p);
+    return p;
+}
+
 /* Multer — keep image in memory so we can forward to Drive */
 const upload = multer({
     storage: multer.memoryStorage(),
@@ -39,24 +102,46 @@ function withImageUrl(d) {
     };
 }
 
+export async function warmDesignImages() {
+    const designs = await loadDesigns({ fresh: true });
+    for (const d of designs.slice(0, 30)) {
+        if (d.driveFileId) await getImage(d).catch(() => { });
+    }
+}
+
 /* Small in-memory cache so every image request doesn't re-read designs.json from Drive */
 const CACHE_MS = 60 * 1000;
 let cache = { designs: null, at: 0 };
 
+let designsInflight = null;
+
 async function loadDesigns({ fresh = false } = {}) {
     if (!isConnected()) {
         console.warn("loadDesigns: Drive not connected");
-        return [];
+        return cache.designs ? [...cache.designs] : [];
     }
     if (!fresh && cache.designs && Date.now() - cache.at < CACHE_MS) {
         return [...cache.designs];
     }
-    const { dataId } = await getStudioFolders();
-    const doc = await readJson("designs.json", dataId);
-    const designs =
-        doc?.data?.designs || doc?.designs || (Array.isArray(doc) ? doc : []);
-    cache = { designs, at: Date.now() };
-    return [...designs];
+    if (!fresh && designsInflight) return [...(await designsInflight)];
+
+    const p = (async () => {
+        try {
+            const { dataId } = await getStudioFolders();
+            const doc = await readJson("designs.json", dataId);
+            const designs =
+                doc?.data?.designs || doc?.designs || (Array.isArray(doc) ? doc : []);
+            cache = { designs, at: Date.now() };
+            return designs;
+        } catch (err) {
+            if (cache.designs) return cache.designs; // serve stale instead of failing
+            throw err;
+        }
+    })();
+
+    designsInflight = p;
+    try { return [...(await p)]; }
+    finally { if (designsInflight === p) designsInflight = null; }
 }
 
 async function saveDesigns(designs) {
@@ -85,19 +170,16 @@ router.get("/:id/image", async (req, res) => {
         const design = (await loadDesigns()).find(d => d.id === req.params.id);
         if (!design?.driveFileId) return res.status(404).end();
 
-        const { stream, contentType } = await getFileStream(design.driveFileId);
+        const img = await getImage(design);
 
-        res.setHeader(
-            "Content-Type",
-            contentType?.startsWith("image/") ? contentType : "image/jpeg"
-        );
-        res.setHeader("Cache-Control", "public, max-age=86400");
-
-        stream.on("error", (err) => {
-            console.error("Image stream error:", err.message);
-            res.destroy(err);
+        res.set({
+            "Content-Type": img.contentType,
+            "Cache-Control": "public, max-age=86400",
+            "Cross-Origin-Resource-Policy": "cross-origin",
+            ETag: img.etag,
         });
-        stream.pipe(res);
+        if (req.headers["if-none-match"] === img.etag) return res.status(304).end();
+        res.end(img.buf);
     } catch (err) {
         console.error("GET /designs/:id/image failed:", err.message);
         if (!res.headersSent) res.status(err.code === 404 ? 404 : 502).end();
