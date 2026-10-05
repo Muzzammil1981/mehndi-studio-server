@@ -78,6 +78,7 @@ export async function generateEventToken(eventId) {
 
 /* =========================================================
    GET /api/events/active
+   IMPORTANT: Must be declared BEFORE /:id
 ========================================================= */
 router.get("/active", async (req, res) => {
     try {
@@ -99,7 +100,26 @@ router.get("/active", async (req, res) => {
 });
 
 /* =========================================================
-   GET /api/events (Admin)
+   GET /api/events/:id (Public - for QR code scans)
+   NEW: Fetch any event by ID, regardless of active status
+========================================================= */
+router.get("/:id", async (req, res) => {
+    try {
+        const events = await loadEvents({ fresh: true });
+        const event = events.find(e => e.id === req.params.id);
+
+        if (!event) {
+            return res.status(404).json({ message: "Event not found" });
+        }
+
+        return res.json({ active: true, event, currentToken: event.tokenCounter || 0 });
+    } catch (err) {
+        return res.status(500).json({ message: err.message || "Failed to load event" });
+    }
+});
+
+/* =========================================================
+   GET /api/events (Admin) - List all
 ========================================================= */
 router.get("/", requireAuth, async (req, res) => {
     if (!["ADMIN", "SUPERADMIN"].includes(req.user.role)) return res.status(403).json({ message: "Admin only" });
@@ -132,7 +152,7 @@ router.post("/", requireAuth, async (req, res) => {
             endDate,
             designIds: Array.isArray(designIds) ? designIds : [],
             priceOverrides: priceOverrides && typeof priceOverrides === "object" && !Array.isArray(priceOverrides) ? priceOverrides : {},
-            tokenCounter: 0, // Initialize token counter
+            tokenCounter: 0,
             createdAt: new Date().toISOString(),
         };
 
