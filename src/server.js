@@ -38,7 +38,7 @@ app.use("/api/designs", designsRoutes);
 
 import { warmDesignImages } from "./routes/designs.js";
 // after server.listen(...)
-setTimeout(() => warmDesignImages().catch(() => {}), 2000);
+setTimeout(() => warmDesignImages().catch(() => { }), 2000);
 
 
 import usersRoutes from "./routes/users.js";
@@ -52,6 +52,9 @@ app.use("/api/settings", settingsRoutes);
 
 import reportsRoutes from "./routes/reports.js";
 app.use("/api/reports", reportsRoutes);
+
+import eventRoutes from "./routes/events.js";
+app.use("/api/events", eventRoutes);
 
 initSocket(server);
 

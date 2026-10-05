@@ -53,7 +53,6 @@ export function getAuthUrl() {
 
 export async function exchangeCode(code) {
     const { tokens } = await oauth2Client.getToken(code);
-    // console.log("REFRESH TOKEN:", tokens.refresh_token);
     oauth2Client.setCredentials(tokens);
     writeTokens(tokens);
 
@@ -171,6 +170,7 @@ export async function getFileStream(fileId) {
         contentType: res.headers["content-type"] || "application/octet-stream",
     };
 }
+
 export async function makePublic(fileId) {
     try {
         await drive().permissions.create({
@@ -180,7 +180,6 @@ export async function makePublic(fileId) {
         console.log("✅ Made public:", fileId);
     } catch (err) {
         console.error("❌ makePublic failed for", fileId, ":", err.message);
-        // Fallback: try changing the parent folder's permissions
         throw err;
     }
 }
@@ -193,13 +192,19 @@ export async function deleteFile(fileId) {
     }
 }
 
-/* ---------- JSON helpers (Data/ folder) ---------- */
+/* =========================================================
+   LOW-LEVEL JSON HELPERS (Requires explicit parentId)
+   ========================================================= */
 
 export async function readJson(fileName, parentId) {
     const q = `name='${fileName}' and '${parentId}' in parents and trashed=false`;
     const list = await drive().files.list({ q, fields: "files(id)" });
     const file = list.data.files?.[0];
-    if (!file) return null;
+
+    if (!file) {
+        console.warn(`⚠️ readJson: '${fileName}' not found in folder ${parentId}`);
+        return null;
+    }
 
     const res = await drive().files.get(
         { fileId: file.id, alt: "media" },
@@ -217,6 +222,7 @@ export async function writeJson(fileName, data, parentId) {
 
     if (existing) {
         await drive().files.update({ fileId: existing.fileId, media });
+        console.log(`📝 writeJson: Updated '${fileName}' in folder ${parentId}`);
         return existing.fileId;
     }
 
@@ -225,7 +231,23 @@ export async function writeJson(fileName, data, parentId) {
         media,
         fields: "id",
     });
+    console.log(`📝 writeJson: Created '${fileName}' in folder ${parentId}`);
     return created.data.id;
+}
+
+/* =========================================================
+   HIGH-LEVEL DATA JSON HELPERS (Auto-detects Data/ folder)
+   Use these in your routes to avoid passing dataId manually!
+   ========================================================= */
+
+export async function readDataJson(fileName) {
+    const { dataId } = await getStudioFolders();
+    return readJson(fileName, dataId);
+}
+
+export async function writeDataJson(fileName, data) {
+    const { dataId } = await getStudioFolders();
+    return writeJson(fileName, data, dataId);
 }
 
 /* ---------- Generic file helpers (for Excel, PDFs, etc.) ---------- */

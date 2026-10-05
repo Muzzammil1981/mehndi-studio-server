@@ -15,8 +15,13 @@ async function saveAll(orders) {
     await writeJson(FILE, { orders }, dataId);
 }
 
-/* ---------- Create ---------- */
-export async function createOrder({ user, items, requestedDate, requestedTime, notes }) {
+/* =========================================================
+   CREATE ORDER
+========================================================= */
+export async function createOrder({
+    user, items, requestedDate, requestedTime, notes,
+    eventId, tokenNumber
+}) {
     if (!user?.id) throw new Error("You must be signed in");
     if (!items?.length) throw new Error("Cart is empty");
     if (!requestedDate) throw new Error("Appointment date is required");
@@ -34,11 +39,12 @@ export async function createOrder({ user, items, requestedDate, requestedTime, n
         requestedDate,
         requestedTime,
         notes: String(notes || "").trim(),
-        status: "pending",           // pending | approved | rejected | awaiting-verification | paid
+        status: "pending",
+        eventId: eventId || null,
+        tokenNumber: tokenNumber || null,
         adminNote: "",
         proposedDate: "",
         proposedTime: "",
-        /* payment */
         utr: "",
         paymentClaimedAt: "",
         paymentId: "",
@@ -87,14 +93,11 @@ export async function claimPayment({ id, userId, utr }) {
     if (!utr || String(utr).trim().length < 6) {
         throw new Error("Please enter a valid UTR / Transaction ID (at least 6 characters)");
     }
-
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
     if (!order) throw new Error("Order not found");
     if (order.userId !== userId) throw new Error("Forbidden");
-    if (order.status !== "approved") {
-        throw new Error("Order is not in a payable state");
-    }
+    if (order.status !== "approved") throw new Error("Order is not in a payable state");
 
     order.status = "awaiting-verification";
     order.utr = String(utr).trim().toUpperCase();
@@ -109,9 +112,7 @@ export async function confirmPayment({ id, paymentNote }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
     if (!order) throw new Error("Order not found");
-    if (order.status !== "awaiting-verification") {
-        throw new Error("Order is not awaiting verification");
-    }
+    if (order.status !== "awaiting-verification") throw new Error("Order is not awaiting verification");
 
     order.status = "paid";
     order.paymentId = `PAY-${Date.now().toString(36).toUpperCase()}`;
@@ -127,11 +128,9 @@ export async function rejectPayment({ id, reason }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
     if (!order) throw new Error("Order not found");
-    if (order.status !== "awaiting-verification") {
-        throw new Error("Order is not awaiting verification");
-    }
+    if (order.status !== "awaiting-verification") throw new Error("Order is not awaiting verification");
 
-    order.status = "approved";          // back to payable
+    order.status = "approved";
     order.paymentRejectReason = String(reason || "").trim();
     order.paymentRejectedAt = new Date().toISOString();
     order.utr = "";
@@ -146,12 +145,8 @@ export async function startWork({ id }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
     if (!order) throw new Error("Order not found");
-    if (order.status !== "paid") {
-        throw new Error("Only paid orders can start work");
-    }
-    if (order.startedAt && !order.endedAt) {
-        throw new Error("Work is already in progress for this order");
-    }
+    if (order.status !== "paid") throw new Error("Only paid orders can start work");
+    if (order.startedAt && !order.endedAt) throw new Error("Work is already in progress for this order");
 
     order.status = "in-progress";
     order.startedAt = new Date().toISOString();
@@ -167,9 +162,7 @@ export async function endWork({ id, workNote }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
     if (!order) throw new Error("Order not found");
-    if (order.status !== "in-progress") {
-        throw new Error("Work is not in progress");
-    }
+    if (order.status !== "in-progress") throw new Error("Work is not in progress");
     if (!order.startedAt) throw new Error("Work was never started");
 
     const endedAt = new Date();
@@ -185,8 +178,10 @@ export async function endWork({ id, workNote }) {
     return order;
 }
 
-/* ---------- Reports: aggregate stats ---------- */
-export async function buildReport({ from, to, userId }) {
+/* =========================================================
+   Reports: aggregate stats
+========================================================= */
+export async function buildReport({ from, to, userId, eventId }) { // <-- Added eventId
     const orders = await loadAll();
 
     const fromMs = from ? new Date(from).getTime() : 0;
@@ -196,6 +191,7 @@ export async function buildReport({ from, to, userId }) {
         const t = new Date(o.updatedAt || o.createdAt).getTime();
         if (t < fromMs || t > toMs) return false;
         if (userId && o.userId !== userId) return false;
+        if (eventId && o.eventId !== eventId) return false; // <-- Added event filter
         return true;
     });
 
@@ -208,15 +204,12 @@ export async function buildReport({ from, to, userId }) {
 
     const completedSessions = filtered.filter(o => o.status === "completed" && o.durationSeconds > 0);
     const totalSeconds = completedSessions.reduce((n, o) => n + o.durationSeconds, 0);
-    const avgSeconds = completedSessions.length
-        ? Math.round(totalSeconds / completedSessions.length)
-        : 0;
+    const avgSeconds = completedSessions.length ? Math.round(totalSeconds / completedSessions.length) : 0;
 
     /* Group by day for the chart */
     const byDay = {};
     revenueEligible.forEach(o => {
-        const day = new Date(o.paidAt || o.updatedAt || o.createdAt)
-            .toISOString().slice(0, 10);
+        const day = new Date(o.paidAt || o.updatedAt || o.createdAt).toISOString().slice(0, 10);
         byDay[day] = (byDay[day] || 0) + (o.total || 0);
     });
     const dailyRevenue = Object.entries(byDay)
@@ -232,9 +225,7 @@ export async function buildReport({ from, to, userId }) {
         byUser[key].revenue += o.total || 0;
         byUser[key].totalSeconds += o.durationSeconds || 0;
     });
-    const topCustomers = Object.values(byUser)
-        .sort((a, b) => b.revenue - a.revenue)
-        .slice(0, 5);
+    const topCustomers = Object.values(byUser).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
 
     /* Top designs */
     const byDesign = {};
@@ -246,17 +237,30 @@ export async function buildReport({ from, to, userId }) {
             byDesign[key].revenue += (it.qty || 0) * (it.price || 0);
         });
     });
-    const topDesigns = Object.values(byDesign)
-        .sort((a, b) => b.revenue - a.revenue)
-        .slice(0, 5);
+    const topDesigns = Object.values(byDesign).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
 
-    /* Recent sessions list (completed + in-progress) */
+    /* EVENT SUMMARY (Token Performance) */
+    const eventStats = {};
+    filtered.forEach(o => {
+        if (!o.eventId) return;
+        if (!eventStats[o.eventId]) {
+            eventStats[o.eventId] = { eventId: o.eventId, tokensIssued: 0, paidOrders: 0, revenue: 0 };
+        }
+        const stat = eventStats[o.eventId];
+        if (o.tokenNumber) stat.tokensIssued += 1;
+        if (o.status === "paid" || o.status === "completed") {
+            stat.paidOrders += 1;
+            stat.revenue += o.total || 0;
+        }
+    });
+    const eventSummary = Object.values(eventStats).sort((a, b) => b.tokensIssued - a.tokensIssued);
+
+    /* Recent sessions list */
     const sessions = filtered
         .filter(o => o.startedAt)
         .sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt))
         .slice(0, 100);
 
-    /* Unique customers set */
     const uniqueCustomers = new Set(revenueEligible.map(o => o.userId)).size;
 
     return {
@@ -271,6 +275,7 @@ export async function buildReport({ from, to, userId }) {
         dailyRevenue,
         topCustomers,
         topDesigns,
+        eventSummary,
         sessions,
     };
 }

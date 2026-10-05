@@ -6,20 +6,45 @@ import {
 } from "../services/orderService.js";
 import { getStudioSettings, generateDynamicQr } from "../services/settingsService.js";
 import { notifyAdmins, notifyUser } from "../socket.js";
+import { generateEventToken } from "./events.js"; // <-- IMPORT TOKEN GENERATOR
 
 const router = express.Router();
 
-/* Create order */
+/* =========================================================
+   Create order
+   (Now handles Event Tokens for First Come, First Serve)
+========================================================= */
 router.post("/", requireAuth, async (req, res) => {
     try {
-        const { items, requestedDate, requestedTime, notes } = req.body || {};
+        const { items, requestedDate, requestedTime, notes, eventId } = req.body || {};
+
+        let tokenNumber = null;
+
+        // If this order is for an event, generate the next token
+        if (eventId) {
+            try {
+                tokenNumber = await generateEventToken(eventId);
+                console.log(`🎟️ Generated Event Token #${tokenNumber} for event ${eventId}`);
+            } catch (err) {
+                console.error("❌ Failed to generate event token:", err.message);
+                // We continue the order even if token fails, but you can choose to block it
+            }
+        }
+
         const order = await createOrder({
-            user: req.user, items, requestedDate, requestedTime, notes,
+            user: req.user,
+            items,
+            requestedDate,
+            requestedTime,
+            notes,
+            eventId,      // Save event reference
+            tokenNumber   // Save the token
         });
 
+        // Notify admin with token number if applicable
         notifyAdmins({
             type: "new-order",
-            title: "New appointment request",
+            title: eventId ? `New Event Order (Token #${tokenNumber})` : "New appointment request",
             body: `${order.username} requested ${order.requestedDate} at ${order.requestedTime}`,
             orderId: order.id,
             at: new Date().toISOString(),
