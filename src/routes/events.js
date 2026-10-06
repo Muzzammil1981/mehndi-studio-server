@@ -182,4 +182,68 @@ router.delete("/:id", requireAuth, async (req, res) => {
     }
 });
 
+/* =========================================================
+   GET /api/events/:id/queue (Public - for Monitor Display)
+   Returns live queue status: now serving, up next, completed
+========================================================= */
+/* =========================================================
+   GET /api/events/:id/queue (Public — for Monitor Display)
+========================================================= */
+router.get("/:id/queue", async (req, res) => {
+    try {
+        const events = await loadEvents({ fresh: true });
+        const event = events.find(e => e.id === req.params.id);
+        if (!event) return res.status(404).json({ message: "Event not found" });
+
+        const { dataId } = await getStudioFolders();
+        const doc = await readJson("orders.json", dataId);
+        const allOrders = doc?.data?.orders || [];
+
+        const eventOrders = allOrders.filter(o => o.eventId === event.id && o.tokenNumber);
+
+        // UPDATED: include image + startedAt for the now-serving token
+        const nowServing = eventOrders
+            .filter(o => o.status === "in-progress")
+            .sort((a, b) => a.tokenNumber - b.tokenNumber)
+            .map(o => ({
+                tokenNumber: o.tokenNumber,
+                username: o.username,
+                image: o.items?.[0]?.image || null,
+                itemName: o.items?.[0]?.name || null,
+                startedAt: o.startedAt || null,
+            }));
+
+        const upNext = eventOrders
+            .filter(o => o.status === "paid")
+            .sort((a, b) => a.tokenNumber - b.tokenNumber)
+            .slice(0, 6)
+            .map(o => ({
+                tokenNumber: o.tokenNumber,
+                username: o.username,
+                image: o.items?.[0]?.image || null,
+            }));
+
+        const recentlyCompleted = eventOrders
+            .filter(o => o.status === "completed")
+            .sort((a, b) => b.tokenNumber - a.tokenNumber)
+            .slice(0, 4)
+            .map(o => ({
+                tokenNumber: o.tokenNumber,
+                username: o.username,
+                durationSeconds: o.durationSeconds || 0,
+            }));
+
+        res.json({
+            event: { id: event.id, name: event.name },
+            nowServing,
+            upNext,
+            recentlyCompleted,
+            totalTokens: event.tokenCounter || 0,
+            lastUpdated: new Date().toISOString(),
+        });
+    } catch (err) {
+        res.status(500).json({ message: err.message || "Failed to load queue" });
+    }
+});
+
 export default router;

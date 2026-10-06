@@ -15,12 +15,26 @@ async function saveAll(orders) {
     await writeJson(FILE, { orders }, dataId);
 }
 
+/* ---------- NEW: Load events for name mapping ---------- */
+async function loadEventNameMap() {
+    try {
+        if (!isConnected()) return {};
+        const { dataId } = await getStudioFolders();
+        const doc = await readJson("events.json", dataId);
+        const events = doc?.data?.events || (Array.isArray(doc) ? doc : []);
+        return Object.fromEntries(events.map(e => [e.id, e.name]));
+    } catch (err) {
+        console.error("Failed to load events for name mapping:", err.message);
+        return {};
+    }
+}
+
 /* =========================================================
-   CREATE ORDER
+   CREATE ORDER (Now supports auto-approval for events)
 ========================================================= */
 export async function createOrder({
     user, items, requestedDate, requestedTime, notes,
-    eventId, tokenNumber
+    eventId, status
 }) {
     if (!user?.id) throw new Error("You must be signed in");
     if (!items?.length) throw new Error("Cart is empty");
@@ -39,9 +53,9 @@ export async function createOrder({
         requestedDate,
         requestedTime,
         notes: String(notes || "").trim(),
-        status: "pending",
+        status: status || "pending",
         eventId: eventId || null,
-        tokenNumber: tokenNumber || null,
+        tokenNumber: null,
         adminNote: "",
         proposedDate: "",
         proposedTime: "",
@@ -64,12 +78,30 @@ export async function createOrder({
 /* ---------- Read ---------- */
 export async function listOrders({ userId, role }) {
     const orders = await loadAll();
-    if (role === "ADMIN") return orders;
-    return orders.filter(o => o.userId === userId);
+    const eventNameMap = await loadEventNameMap(); // <-- NEW
+
+    // Attach eventName to each order
+    const mappedOrders = orders.map(o => ({
+        ...o,
+        eventName: o.eventId ? (eventNameMap[o.eventId] || null) : null
+    }));
+
+    if (role === "ADMIN") return mappedOrders;
+    return mappedOrders.filter(o => o.userId === userId);
 }
 
 export async function getOrder(id) {
-    return (await loadAll()).find(o => o.id === id) || null;
+    const order = (await loadAll()).find(o => o.id === id) || null;
+    if (!order) return null;
+
+    // Attach eventName if it's an event order
+    if (order.eventId) {
+        const eventNameMap = await loadEventNameMap();
+        order.eventName = eventNameMap[order.eventId] || null;
+    } else {
+        order.eventName = null;
+    }
+    return order;
 }
 
 /* ---------- Admin: approve / reject / reschedule ---------- */
@@ -89,7 +121,7 @@ export async function updateOrderStatus({ id, status, adminNote, proposedDate, p
 }
 
 /* ---------- User: claim paid (submits UTR) ---------- */
-export async function claimPayment({ id, userId, utr }) {
+export async function claimPayment({ id, userId, utr, tokenNumber }) {
     if (!utr || String(utr).trim().length < 6) {
         throw new Error("Please enter a valid UTR / Transaction ID (at least 6 characters)");
     }
@@ -102,6 +134,11 @@ export async function claimPayment({ id, userId, utr }) {
     order.status = "awaiting-verification";
     order.utr = String(utr).trim().toUpperCase();
     order.paymentClaimedAt = new Date().toISOString();
+
+    if (tokenNumber) {
+        order.tokenNumber = tokenNumber;
+    }
+
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
     return order;
@@ -181,7 +218,7 @@ export async function endWork({ id, workNote }) {
 /* =========================================================
    Reports: aggregate stats
 ========================================================= */
-export async function buildReport({ from, to, userId, eventId }) { // <-- Added eventId
+export async function buildReport({ from, to, userId, eventId }) {
     const orders = await loadAll();
 
     const fromMs = from ? new Date(from).getTime() : 0;
@@ -191,22 +228,17 @@ export async function buildReport({ from, to, userId, eventId }) { // <-- Added 
         const t = new Date(o.updatedAt || o.createdAt).getTime();
         if (t < fromMs || t > toMs) return false;
         if (userId && o.userId !== userId) return false;
-        if (eventId && o.eventId !== eventId) return false; // <-- Added event filter
+        if (eventId && o.eventId !== eventId) return false;
         return true;
     });
 
-    /* Revenue only counts paid + completed orders */
-    const revenueEligible = filtered.filter(o =>
-        o.status === "paid" || o.status === "completed"
-    );
-
+    const revenueEligible = filtered.filter(o => o.status === "paid" || o.status === "completed");
     const totalRevenue = revenueEligible.reduce((n, o) => n + (o.total || 0), 0);
 
     const completedSessions = filtered.filter(o => o.status === "completed" && o.durationSeconds > 0);
     const totalSeconds = completedSessions.reduce((n, o) => n + o.durationSeconds, 0);
     const avgSeconds = completedSessions.length ? Math.round(totalSeconds / completedSessions.length) : 0;
 
-    /* Group by day for the chart */
     const byDay = {};
     revenueEligible.forEach(o => {
         const day = new Date(o.paidAt || o.updatedAt || o.createdAt).toISOString().slice(0, 10);
@@ -216,7 +248,6 @@ export async function buildReport({ from, to, userId, eventId }) { // <-- Added 
         .map(([date, amount]) => ({ date, amount }))
         .sort((a, b) => a.date.localeCompare(b.date));
 
-    /* Top customers */
     const byUser = {};
     revenueEligible.forEach(o => {
         const key = o.userId;
@@ -227,7 +258,6 @@ export async function buildReport({ from, to, userId, eventId }) { // <-- Added 
     });
     const topCustomers = Object.values(byUser).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
 
-    /* Top designs */
     const byDesign = {};
     revenueEligible.forEach(o => {
         (o.items || []).forEach(it => {
@@ -239,7 +269,6 @@ export async function buildReport({ from, to, userId, eventId }) { // <-- Added 
     });
     const topDesigns = Object.values(byDesign).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
 
-    /* EVENT SUMMARY (Token Performance) */
     const eventStats = {};
     filtered.forEach(o => {
         if (!o.eventId) return;
@@ -255,7 +284,6 @@ export async function buildReport({ from, to, userId, eventId }) { // <-- Added 
     });
     const eventSummary = Object.values(eventStats).sort((a, b) => b.tokensIssued - a.tokensIssued);
 
-    /* Recent sessions list */
     const sessions = filtered
         .filter(o => o.startedAt)
         .sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt))

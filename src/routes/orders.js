@@ -6,30 +6,19 @@ import {
 } from "../services/orderService.js";
 import { getStudioSettings, generateDynamicQr } from "../services/settingsService.js";
 import { notifyAdmins, notifyUser } from "../socket.js";
-import { generateEventToken } from "./events.js"; // <-- IMPORT TOKEN GENERATOR
+import { generateEventToken } from "./events.js";
 
 const router = express.Router();
 
 /* =========================================================
-   Create order
-   (Now handles Event Tokens for First Come, First Serve)
+   Create order (Auto-approves Event orders)
 ========================================================= */
 router.post("/", requireAuth, async (req, res) => {
     try {
         const { items, requestedDate, requestedTime, notes, eventId } = req.body || {};
 
-        let tokenNumber = null;
-
-        // If this order is for an event, generate the next token
-        if (eventId) {
-            try {
-                tokenNumber = await generateEventToken(eventId);
-                console.log(`🎟️ Generated Event Token #${tokenNumber} for event ${eventId}`);
-            } catch (err) {
-                console.error("❌ Failed to generate event token:", err.message);
-                // We continue the order even if token fails, but you can choose to block it
-            }
-        }
+        // Auto-approve if it's an event order
+        const status = eventId ? "approved" : "pending";
 
         const order = await createOrder({
             user: req.user,
@@ -37,14 +26,14 @@ router.post("/", requireAuth, async (req, res) => {
             requestedDate,
             requestedTime,
             notes,
-            eventId,      // Save event reference
-            tokenNumber   // Save the token
+            eventId,
+            status // Pass the status
         });
 
-        // Notify admin with token number if applicable
+        // Notify admin
         notifyAdmins({
             type: "new-order",
-            title: eventId ? `New Event Order (Token #${tokenNumber})` : "New appointment request",
+            title: eventId ? `New Event Order (Auto-Approved)` : "New appointment request",
             body: `${order.username} requested ${order.requestedDate} at ${order.requestedTime}`,
             orderId: order.id,
             at: new Date().toISOString(),
@@ -140,19 +129,35 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
     }
 });
 
-/* User submits UTR after paying */
+/* User submits UTR after paying (Generates Token for Events) */
 router.post("/:id/claim-payment", requireAuth, async (req, res) => {
     try {
+        const existingOrder = await getOrder(req.params.id);
+        if (!existingOrder) return res.status(404).json({ message: "Order not found" });
+
+        let tokenNumber = null;
+
+        // NEW: Generate the token ONLY when the user submits the payment UTR
+        if (existingOrder.eventId && !existingOrder.tokenNumber) {
+            try {
+                tokenNumber = await generateEventToken(existingOrder.eventId);
+                console.log(`🎟️ Generated Event Token #${tokenNumber} at payment for event ${existingOrder.eventId}`);
+            } catch (err) {
+                console.error("❌ Failed to generate event token at payment:", err.message);
+            }
+        }
+
         const order = await claimPayment({
             id: req.params.id,
             userId: req.user.id,
             utr: req.body?.utr,
+            tokenNumber // Pass the token to be saved
         });
 
         notifyAdmins({
             type: "payment-claim",
             title: "Payment claimed — verify ⏳",
-            body: `${order.username} paid ₹${order.total} · UTR: ${order.utr}`,
+            body: `${order.username} paid ₹${order.total} · UTR: ${order.utr}${tokenNumber ? ` · Token #${tokenNumber}` : ''}`,
             orderId: order.id,
             at: new Date().toISOString(),
         });
