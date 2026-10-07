@@ -137,7 +137,6 @@ export async function setupStudioFolders() {
     return { rootId, usersId, designsId, dataId };
 }
 
-/** Returns the folder IDs we need for design uploads. Auto-creates missing ones. */
 export async function getStudioFolders() {
     let rootId = readRootFolderId();
     if (!rootId) {
@@ -193,7 +192,7 @@ export async function deleteFile(fileId) {
 }
 
 /* =========================================================
-   LOW-LEVEL JSON HELPERS (Requires explicit parentId)
+   LOW-LEVEL JSON HELPERS
    ========================================================= */
 
 export async function readJson(fileName, parentId) {
@@ -202,7 +201,11 @@ export async function readJson(fileName, parentId) {
     const file = list.data.files?.[0];
 
     if (!file) {
-        console.warn(`⚠️ readJson: '${fileName}' not found in folder ${parentId}`);
+        // Only warn for files that should exist by now;
+        // custom-images.json is created lazily on first upload.
+        if (fileName !== "custom-images.json") {
+            console.warn(`⚠️ readJson: '${fileName}' not found in folder ${parentId}`);
+        }
         return null;
     }
 
@@ -236,8 +239,7 @@ export async function writeJson(fileName, data, parentId) {
 }
 
 /* =========================================================
-   HIGH-LEVEL DATA JSON HELPERS (Auto-detects Data/ folder)
-   Use these in your routes to avoid passing dataId manually!
+   HIGH-LEVEL DATA JSON HELPERS
    ========================================================= */
 
 export async function readDataJson(fileName) {
@@ -250,7 +252,9 @@ export async function writeDataJson(fileName, data) {
     return writeJson(fileName, data, dataId);
 }
 
-/* ---------- Generic file helpers (for Excel, PDFs, etc.) ---------- */
+/* =========================================================
+   GENERIC FILE HELPERS
+   ========================================================= */
 
 export async function findFileByName(name, parentId) {
     const q = [
@@ -262,6 +266,26 @@ export async function findFileByName(name, parentId) {
 
     const res = await drive().files.list({ q, fields: "files(id,name,mimeType)" });
     return res.data.files?.[0] || null;
+}
+
+/* =========================================================
+   NEW: Find files whose name STARTS WITH a prefix.
+   Used to recover orphaned custom-request images that
+   were uploaded before custom-images.json persistence existed.
+   ========================================================= */
+export async function findFilesByNamePrefix(prefix, parentId) {
+    const q = [
+        `name contains '${prefix}'`,
+        parentId ? `'${parentId}' in parents` : null,
+        "trashed=false",
+        "mimeType!='application/vnd.google-apps.folder'",
+    ].filter(Boolean).join(" and ");
+
+    const res = await drive().files.list({
+        q,
+        fields: "files(id,name,mimeType)",
+    });
+    return res.data.files || [];
 }
 
 export async function downloadFileBuffer(fileId) {

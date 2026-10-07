@@ -5,6 +5,7 @@ import { categories } from "../data/categories.js";
 import {
     getStudioFolders, ensureFolder, uploadFile, makePublic, deleteFile,
     readJson, writeJson, isConnected, getFileStream, CATEGORY_ID_TO_FOLDER,
+    findFilesByNamePrefix,
 } from "../services/googleDrive.js";
 import { notifyUsers } from "../socket.js";
 
@@ -14,12 +15,12 @@ const router = express.Router();
    IMAGE CACHES (true LRU, byte-limited)
    ========================================================= */
 function createCache(maxBytes) {
-    const map = new Map(); // id -> { buf, fileId, contentType, etag }
+    const map = new Map();
     let bytes = 0;
     return {
         get(id) {
             const e = map.get(id);
-            if (e) { map.delete(id); map.set(id, e); } // refresh recency
+            if (e) { map.delete(id); map.set(id, e); }
             return e;
         },
         set(id, entry) {
@@ -27,7 +28,7 @@ function createCache(maxBytes) {
             if (old) { bytes -= old.buf.length; map.delete(id); }
             map.set(id, entry);
             bytes += entry.buf.length;
-            for (const [k, v] of map) {               // evict least-recently used
+            for (const [k, v] of map) {
                 if (bytes <= maxBytes) break;
                 map.delete(k); bytes -= v.buf.length;
             }
@@ -39,14 +40,13 @@ function createCache(maxBytes) {
     };
 }
 
-const fullCache = createCache(100 * 1024 * 1024); // full-size images
-const thumbCache = createCache(60 * 1024 * 1024); // 640px thumbnails (~50 KB each)
+const fullCache = createCache(100 * 1024 * 1024);
+const thumbCache = createCache(60 * 1024 * 1024);
 const fullInflight = new Map();
 const thumbInflight = new Map();
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* Concurrency limiter for Drive downloads (never exceeds `max`) */
 let active = 0;
 const waiting = [];
 async function limit(fn, max = 4) {
@@ -58,7 +58,6 @@ async function limit(fn, max = 4) {
 
 /* ---------- image processing ---------- */
 
-/* Full-size: max 1600px, WebP q85. Use .webp({ lossless: true }) for zero loss. */
 function optimize(buffer) {
     return sharp(buffer)
         .rotate()
@@ -112,7 +111,6 @@ async function getImage(design) {
     return p;
 }
 
-/* Thumbnail generated lazily from the full image, then cached. */
 async function getThumb(design) {
     const hit = thumbCache.get(design.id);
     if (hit && hit.fileId === design.driveFileId) return hit;
@@ -140,9 +138,7 @@ async function getThumb(design) {
     return p;
 }
 
-/* =========================================================
-   UPLOAD (multer) with proper JSON errors
-   ========================================================= */
+/* ---------- upload middlewares ---------- */
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 8 * 1024 * 1024 },
@@ -180,8 +176,6 @@ function withImageUrl(d) {
     };
 }
 
-/* Seeded PRNG + shuffle: same seed => same order, so pages of a random
-   feed stay consistent while the user scrolls. A new seed => new order. */
 function mulberry32(seed) {
     let a = seed | 0;
     return function () {
@@ -211,30 +205,13 @@ function matchesQuery(d, tokens) {
     return tokens.every(t => hay.includes(t));
 }
 
-/* Warm the newest designs' thumbnails in the background, one at a time,
-   so real user requests are never stuck behind the warm-up. */
-const WARM_COUNT = 150;
-export async function warmDesignImages() {
-    const designs = await loadDesigns({ fresh: true });
-    const newest = designs
-        .filter(d => d.driveFileId)
-        .sort(byNewest)
-        .slice(0, WARM_COUNT);
-    for (const d of newest) {
-        await getThumb(d).catch(() => { });
-    }
-}
-
-/* Small in-memory cache so every request doesn't re-read designs.json from Drive */
+/* ---------- designs.json cache ---------- */
 const CACHE_MS = 60 * 1000;
 let cache = { designs: null, at: 0 };
 let designsInflight = null;
 
 async function loadDesigns({ fresh = false } = {}) {
-    if (!isConnected()) {
-        console.warn("loadDesigns: Drive not connected");
-        return cache.designs ? [...cache.designs] : [];
-    }
+    if (!isConnected()) return cache.designs ? [...cache.designs] : [];
     if (!fresh && cache.designs && Date.now() - cache.at < CACHE_MS) {
         return [...cache.designs];
     }
@@ -249,7 +226,7 @@ async function loadDesigns({ fresh = false } = {}) {
             cache = { designs, at: Date.now() };
             return designs;
         } catch (err) {
-            if (cache.designs) return cache.designs; // serve stale instead of failing
+            if (cache.designs) return cache.designs;
             throw err;
         }
     })();
@@ -265,19 +242,96 @@ async function saveDesigns(designs) {
     cache = { designs: [...designs], at: Date.now() };
 }
 
+/* ---------- custom-images.json cache ---------- */
+const CUSTOM_FILE = "custom-images.json";
+const CUSTOM_CACHE_MS = 60 * 1000;
+let customCache = { images: null, at: 0 };
+let customInflight = null;
+
+async function loadCustomImages({ fresh = false } = {}) {
+    if (!isConnected()) return customCache.images || [];
+    if (!fresh && customCache.images && Date.now() - customCache.at < CUSTOM_CACHE_MS) {
+        return [...customCache.images];
+    }
+    if (!fresh && customInflight) return [...(await customInflight)];
+
+    const p = (async () => {
+        try {
+            const { dataId } = await getStudioFolders();
+            const doc = await readJson(CUSTOM_FILE, dataId);
+            const images = doc?.data?.images || (Array.isArray(doc) ? doc : []);
+            customCache = { images, at: Date.now() };
+            return images;
+        } catch (err) {
+            if (customCache.images) return customCache.images;
+            return [];
+        }
+    })();
+
+    customInflight = p;
+    try { return [...(await p)]; }
+    finally { if (customInflight === p) customInflight = null; }
+}
+
+async function saveCustomImages(images) {
+    const { dataId } = await getStudioFolders();
+    await writeJson(CUSTOM_FILE, { images }, dataId);
+    customCache = { images: [...images], at: Date.now() };
+}
+
+/* =========================================================
+   NEW: Recover orphaned custom images
+   If metadata is missing, search Drive's Custom-Requests folder
+   for a file whose name starts with the requested id.
+   ========================================================= */
+async function recoverCustomImage(id) {
+    try {
+        const { designsId } = await getStudioFolders();
+        const customFolderId = await ensureFolder("Custom-Requests", designsId);
+
+        const files = await findFilesByNamePrefix(id, customFolderId);
+        const match = files.find(f => f.name.startsWith(id));
+        if (!match) return null;
+
+        // Persist it so future requests are fast
+        const images = await loadCustomImages({ fresh: true });
+        if (!images.find(i => i.id === id)) {
+            images.push({
+                id,
+                driveFileId: match.id,
+                contentType: match.mimeType?.startsWith("image/") ? match.mimeType : "image/webp",
+                createdAt: new Date().toISOString(),
+                recovered: true,
+            });
+            await saveCustomImages(images);
+        }
+
+        console.log(`✅ Recovered custom image from Drive: ${id}`);
+        return { id, driveFileId: match.id };
+    } catch (err) {
+        console.error("recoverCustomImage failed:", err.message);
+        return null;
+    }
+}
+
+/* ---------- warm design thumbnails ---------- */
+const WARM_COUNT = 150;
+export async function warmDesignImages() {
+    const designs = await loadDesigns({ fresh: true });
+    const newest = designs
+        .filter(d => d.driveFileId)
+        .sort(byNewest)
+        .slice(0, WARM_COUNT);
+    for (const d of newest) {
+        await getThumb(d).catch(() => { });
+    }
+}
+
 /* =========================================================
    ROUTES
    ========================================================= */
 
-/* GET /api/designs
-   Paged mode (when `page` or `limit` is sent):
-     ?page=1&limit=12
-     &category=bridal | all
-     &q=search words (all words must match name/description/category)
-     &sort=newest | oldest | random      (random needs &seed=<int>)
-     &featured=true
-   -> { items, total, page, limit, hasMore }
-   Without page/limit it still returns the full array (legacy). */
+/* GET /api/designs — list (paged or full) */
 router.get("/", async (req, res) => {
     try {
         const all = await loadDesigns();
@@ -312,9 +366,7 @@ router.get("/", async (req, res) => {
     }
 });
 
-/* GET /api/designs/summary?seed=123
-   One random cover design + count per category (for the category cards).
-   Must be declared BEFORE "/:id". */
+/* GET /api/designs/summary */
 router.get("/summary", async (req, res) => {
     try {
         const all = await loadDesigns();
@@ -337,15 +389,115 @@ router.get("/summary", async (req, res) => {
     }
 });
 
-/* Image proxy — ?size=thumb returns a small 640px WebP. */
+/* =========================================================
+   POST /api/designs/custom-image
+   ========================================================= */
+router.post("/custom-image", uploadImage, async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ message: "Image required (JPG, PNG or WebP)" });
+        }
+        if (!isConnected()) {
+            return res.status(503).json({ message: "Google Drive not connected" });
+        }
+
+        const { designsId } = await getStudioFolders();
+        const customFolderId = await ensureFolder("Custom-Requests", designsId);
+
+        const safeName = slugify(req.file.originalname.replace(/\.[^.]+$/, "")) || "reference";
+        const id = `custom-${safeName}-${Date.now()}`;
+
+        let imageBuffer = req.file.buffer;
+        let mimeType = req.file.mimetype;
+        let fileName;
+
+        try {
+            imageBuffer = await optimize(req.file.buffer);
+            mimeType = "image/webp";
+            fileName = `${id}.webp`;
+        } catch (e) {
+            console.warn("sharp failed, uploading original:", e.message);
+            const ext = (req.file.originalname.split(".").pop() || "jpg").toLowerCase();
+            fileName = `${id}.${ext}`;
+        }
+
+        const uploaded = await uploadFile({
+            name: fileName,
+            mimeType,
+            buffer: imageBuffer,
+            parentId: customFolderId,
+        });
+
+        try {
+            await makePublic(uploaded.id);
+        } catch (err) {
+            console.error("⚠️  makePublic failed, retrying in 1s…", err.message);
+            await sleep(1000);
+            try { await makePublic(uploaded.id); } catch { }
+        }
+
+        // Warm caches
+        fullCache.set(id, {
+            buf: imageBuffer,
+            fileId: uploaded.id,
+            contentType: mimeType,
+            etag: `"${uploaded.id}-${imageBuffer.length}"`,
+        });
+        makeThumb(imageBuffer)
+            .then(buf => thumbCache.set(id, {
+                buf,
+                fileId: uploaded.id,
+                contentType: "image/webp",
+                etag: `"${uploaded.id}-t-${buf.length}"`,
+            }))
+            .catch(() => { });
+
+        // Persist to custom-images.json
+        const images = await loadCustomImages({ fresh: true });
+        images.push({
+            id,
+            driveFileId: uploaded.id,
+            contentType: mimeType,
+            createdAt: new Date().toISOString(),
+        });
+        await saveCustomImages(images);
+
+        res.status(201).json({
+            imageId: id,
+            image: proxyImagePath(id),
+            driveFileId: uploaded.id,
+        });
+    } catch (err) {
+        console.error("POST /designs/custom-image failed:", err);
+        res.status(500).json({ message: err.message });
+    }
+});
+
+/* =========================================================
+   Image proxy — designs.json → custom-images.json → Drive recovery
+   ========================================================= */
 router.get("/:id/image", async (req, res) => {
     try {
-        const design = (await loadDesigns()).find(d => d.id === req.params.id);
-        if (!design?.driveFileId) return res.status(404).end();
+        const id = req.params.id;
+
+        // 1. designs.json
+        let item = (await loadDesigns()).find(d => d.id === id);
+
+        // 2. custom-images.json
+        if (!item) {
+            item = (await loadCustomImages()).find(d => d.id === id);
+        }
+
+        // 3. Drive fallback (recover orphaned images)
+        if (!item) {
+            item = await recoverCustomImage(id);
+        }
+
+        if (!item?.driveFileId) return res.status(404).end();
 
         const img = req.query.size === "thumb"
-            ? await getThumb(design)
-            : await getImage(design);
+            ? await getThumb(item)
+            : await getImage(item);
 
         res.set({
             "Content-Type": img.contentType,
@@ -361,6 +513,7 @@ router.get("/:id/image", async (req, res) => {
     }
 });
 
+/* GET /api/designs/:id */
 router.get("/:id", async (req, res) => {
     try {
         const design = (await loadDesigns()).find(d => d.id === req.params.id);
@@ -371,6 +524,7 @@ router.get("/:id", async (req, res) => {
     }
 });
 
+/* POST /api/designs — create a new catalog design */
 router.post("/", uploadImage, async (req, res) => {
     try {
         const { name, description, price, amountType, categoryId, featured } = req.body;
@@ -414,10 +568,9 @@ router.post("/", uploadImage, async (req, res) => {
         } catch (err) {
             console.error("⚠️  Could not make public, retrying in 1s…", err.message);
             await sleep(1000);
-            try { await makePublic(uploaded.id); } catch { /* proxy still works */ }
+            try { await makePublic(uploaded.id); } catch { }
         }
 
-        /* Warm both caches so the very first view never waits on Drive */
         fullCache.set(id, {
             buf: imageBuffer,
             fileId: uploaded.id,
@@ -431,7 +584,7 @@ router.post("/", uploadImage, async (req, res) => {
                 contentType: "image/webp",
                 etag: `"${uploaded.id}-t-${buf.length}"`,
             }))
-            .catch(() => { /* generated lazily on first request */ });
+            .catch(() => { });
 
         const design = {
             id,
@@ -466,6 +619,7 @@ router.post("/", uploadImage, async (req, res) => {
     }
 });
 
+/* DELETE /api/designs/:id */
 router.delete("/:id", async (req, res) => {
     try {
         const designs = await loadDesigns({ fresh: true });

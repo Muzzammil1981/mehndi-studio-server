@@ -199,39 +199,73 @@ router.get("/:id/queue", async (req, res) => {
         const doc = await readJson("orders.json", dataId);
         const allOrders = doc?.data?.orders || [];
 
-        const eventOrders = allOrders.filter(o => o.eventId === event.id && o.tokenNumber);
+        const eventOrders = allOrders.filter(o => o.eventId === event.id);
+        const tokens = [];
 
-        // UPDATED: include image + startedAt for the now-serving token
-        const nowServing = eventOrders
-            .filter(o => o.status === "in-progress")
-            .sort((a, b) => a.tokenNumber - b.tokenNumber)
-            .map(o => ({
+        eventOrders.forEach(o => {
+            // ---- Group order: expand into one token per member ----
+            if (o.isGroup && Array.isArray(o.members)) {
+                o.members.forEach(m => {
+                    if (!m.tokenNumber) return;
+
+                    // BUG FIX: members default to status "pending" and stay that
+                    // way until the admin clicks Start. If the parent order is
+                    // already paid (or in-progress), treat pending members as
+                    // "paid" so they show up in the Up-next queue.
+                    let effectiveStatus = m.status || "pending";
+                    if (
+                        effectiveStatus === "pending" &&
+                        (o.status === "paid" || o.status === "in-progress")
+                    ) {
+                        effectiveStatus = "paid";
+                    }
+
+                    const mItem = m.items?.[0];
+                    tokens.push({
+                        tokenNumber: m.tokenNumber,
+                        username: m.name || o.username,
+                        groupOwner: o.username,
+                        isGroupMember: true,
+                        image: mItem?.image || null,
+                        itemName: mItem?.name || "Group booking",
+                        status: effectiveStatus,
+                        startedAt: m.startedAt || null,
+                        durationSeconds: m.durationSeconds || 0,
+                    });
+                });
+                return;
+            }
+
+            // ---- Single order (including custom) ----
+            if (!o.tokenNumber) return;
+            const item = o.items?.[0];
+            const isCustom = o.type === "custom";
+            tokens.push({
                 tokenNumber: o.tokenNumber,
                 username: o.username,
-                image: o.items?.[0]?.image || null,
-                itemName: o.items?.[0]?.name || null,
+                isGroupMember: false,
+                image: item?.image || o.customImage || null,
+                itemName: item?.name || (isCustom ? "Custom design" : "Design"),
+                status: o.status,
                 startedAt: o.startedAt || null,
-            }));
-
-        const upNext = eventOrders
-            .filter(o => o.status === "paid")
-            .sort((a, b) => a.tokenNumber - b.tokenNumber)
-            .slice(0, 6)
-            .map(o => ({
-                tokenNumber: o.tokenNumber,
-                username: o.username,
-                image: o.items?.[0]?.image || null,
-            }));
-
-        const recentlyCompleted = eventOrders
-            .filter(o => o.status === "completed")
-            .sort((a, b) => b.tokenNumber - a.tokenNumber)
-            .slice(0, 4)
-            .map(o => ({
-                tokenNumber: o.tokenNumber,
-                username: o.username,
                 durationSeconds: o.durationSeconds || 0,
-            }));
+                isCustom,
+            });
+        });
+
+        const nowServing = tokens
+            .filter(t => t.status === "in-progress")
+            .sort((a, b) => a.tokenNumber - b.tokenNumber);
+
+        const upNext = tokens
+            .filter(t => t.status === "paid")
+            .sort((a, b) => a.tokenNumber - b.tokenNumber)
+            .slice(0, 6);
+
+        const recentlyCompleted = tokens
+            .filter(t => t.status === "completed")
+            .sort((a, b) => b.tokenNumber - a.tokenNumber)
+            .slice(0, 4);
 
         res.json({
             event: { id: event.id, name: event.name },

@@ -15,7 +15,7 @@ async function saveAll(orders) {
     await writeJson(FILE, { orders }, dataId);
 }
 
-/* ---------- NEW: Load events for name mapping ---------- */
+/* ---------- Load events for name mapping ---------- */
 async function loadEventNameMap() {
     try {
         if (!isConnected()) return {};
@@ -30,35 +30,95 @@ async function loadEventNameMap() {
 }
 
 /* =========================================================
-   CREATE ORDER (Now supports auto-approval for events)
+   CREATE ORDER (supports custom + group/family bookings)
 ========================================================= */
 export async function createOrder({
     user, items, requestedDate, requestedTime, notes,
-    eventId, status
+    eventId, status, paymentMethod,
+    type, customDescription, customImageId, customImage, suggestedPrice,
+    isGroup, members,
 }) {
     if (!user?.id) throw new Error("You must be signed in");
-    if (!items?.length) throw new Error("Cart is empty");
-    if (!requestedDate) throw new Error("Appointment date is required");
-    if (!requestedTime) throw new Error("Appointment time is required");
 
-    const total = items.reduce((n, x) => n + x.qty * x.price, 0);
+    if (type === "custom") {
+        if (!customDescription?.trim()) throw new Error("Please describe your custom design");
+        if (!suggestedPrice || Number(suggestedPrice) <= 0) {
+            throw new Error("Please suggest a price for your custom design");
+        }
+        // Custom orders made from an event page auto-fill "now" — no scheduling needed
+        if (!eventId) {
+            if (!requestedDate) throw new Error("Appointment date is required");
+            if (!requestedTime) throw new Error("Appointment time is required");
+        }
+    } else if (isGroup) {
+        if (!Array.isArray(members) || members.length < 2) {
+            throw new Error("Group bookings require at least 2 members");
+        }
+        if (members.some(m => !m.name?.trim())) {
+            throw new Error("Every group member needs a name");
+        }
+        if (members.some(m => !Array.isArray(m.items) || m.items.length === 0)) {
+            throw new Error("Each member needs at least one design");
+        }
+        if (!requestedDate) throw new Error("Appointment date is required");
+        if (!requestedTime) throw new Error("Appointment time is required");
+    } else {
+        if (!items?.length) throw new Error("Cart is empty");
+        if (!requestedDate) throw new Error("Appointment date is required");
+        if (!requestedTime) throw new Error("Appointment time is required");
+    }
+
+    /* Build normalized member list */
+    const memberList = isGroup && Array.isArray(members)
+        ? members.map((m, i) => {
+            const mItems = Array.isArray(m.items) ? m.items : [];
+            const subtotal = mItems.reduce((n, x) => n + x.qty * x.price, 0);
+            return {
+                memberId: m.memberId || `m-${i + 1}`,
+                name: String(m.name || `Member ${i + 1}`).trim(),
+                items: mItems,
+                subtotal,
+                tokenNumber: null,
+                status: "pending",
+                startedAt: "",
+                endedAt: "",
+                durationSeconds: 0,
+            };
+        })
+        : [];
+
+    const total = isGroup
+        ? memberList.reduce((sum, m) => sum + m.subtotal, 0)
+        : (items?.reduce((n, x) => n + x.qty * x.price, 0) || 0);
 
     const order = {
         id: crypto.randomUUID(),
         userId: user.id,
         username: user.username,
         email: user.email,
-        items,
+        type: type || "standard",
+        isGroup: Boolean(isGroup),
+        members: memberList,
+        items: isGroup ? [] : (items || []),
         total,
         requestedDate,
         requestedTime,
         notes: String(notes || "").trim(),
         status: status || "pending",
+        paymentMethod: paymentMethod || "upi",
         eventId: eventId || null,
         tokenNumber: null,
         adminNote: "",
         proposedDate: "",
         proposedTime: "",
+
+        customDescription: String(customDescription || "").trim(),
+        customImageId: customImageId || null,
+        customImage: customImage || null,
+        suggestedPrice: suggestedPrice ? Number(suggestedPrice) : null,
+        quotedPrice: null,
+        negotiationHistory: [],
+
         utr: "",
         paymentClaimedAt: "",
         paymentId: "",
@@ -78,9 +138,8 @@ export async function createOrder({
 /* ---------- Read ---------- */
 export async function listOrders({ userId, role }) {
     const orders = await loadAll();
-    const eventNameMap = await loadEventNameMap(); // <-- NEW
+    const eventNameMap = await loadEventNameMap();
 
-    // Attach eventName to each order
     const mappedOrders = orders.map(o => ({
         ...o,
         eventName: o.eventId ? (eventNameMap[o.eventId] || null) : null
@@ -94,7 +153,6 @@ export async function getOrder(id) {
     const order = (await loadAll()).find(o => o.id === id) || null;
     if (!order) return null;
 
-    // Attach eventName if it's an event order
     if (order.eventId) {
         const eventNameMap = await loadEventNameMap();
         order.eventName = eventNameMap[order.eventId] || null;
@@ -120,8 +178,70 @@ export async function updateOrderStatus({ id, status, adminNote, proposedDate, p
     return order;
 }
 
+/* ---------- User: set payment method ---------- */
+export async function setPaymentMethod({ id, userId, method }) {
+    if (!["upi", "card", "cash"].includes(method)) {
+        throw new Error("Invalid payment method");
+    }
+    const orders = await loadAll();
+    const order = orders.find(o => o.id === id);
+    if (!order) throw new Error("Order not found");
+    if (order.userId !== userId) throw new Error("Forbidden");
+    if (order.status !== "approved" && order.status !== "pending") {
+        throw new Error("Order is not in a modifiable state");
+    }
+
+    order.paymentMethod = method;
+    order.updatedAt = new Date().toISOString();
+    await saveAll(orders);
+    return order;
+}
+
+/* ---------- User: modify order items ---------- */
+export async function updateOrderItems({ id, userId, items }) {
+    if (!Array.isArray(items) || items.length === 0) {
+        throw new Error("Order must contain at least one design");
+    }
+    const orders = await loadAll();
+    const order = orders.find(o => o.id === id);
+    if (!order) throw new Error("Order not found");
+    if (order.userId !== userId) throw new Error("Forbidden");
+    if (order.isGroup) throw new Error("Group orders can't be modified");
+
+    const modifiable = ["pending", "approved", "awaiting-verification"];
+    if (!modifiable.includes(order.status)) {
+        throw new Error("This order can no longer be modified. Please contact the studio.");
+    }
+
+    const newTotal = items.reduce((n, x) => n + x.qty * x.price, 0);
+    if (newTotal <= 0) throw new Error("New total must be greater than 0");
+
+    const previousTotal = order.total;
+    const previousItems = order.items;
+    const difference = newTotal - previousTotal;
+
+    order.modifications = order.modifications || [];
+    order.modifications.push({
+        at: new Date().toISOString(),
+        previousItems, previousTotal, newItems: items, newTotal, difference,
+    });
+
+    order.items = items;
+    order.total = newTotal;
+    order.previousTotal = previousTotal;
+    order.totalDifference = difference;
+    order.status = order.eventId ? "approved" : "pending";
+    order.utr = "";
+    order.paymentClaimedAt = "";
+    order.paymentRejectReason = "";
+    order.updatedAt = new Date().toISOString();
+
+    await saveAll(orders);
+    return order;
+}
+
 /* ---------- User: claim paid (submits UTR) ---------- */
-export async function claimPayment({ id, userId, utr, tokenNumber }) {
+export async function claimPayment({ id, userId, utr, tokenNumber, tokenNumbers }) {
     if (!utr || String(utr).trim().length < 6) {
         throw new Error("Please enter a valid UTR / Transaction ID (at least 6 characters)");
     }
@@ -135,7 +255,12 @@ export async function claimPayment({ id, userId, utr, tokenNumber }) {
     order.utr = String(utr).trim().toUpperCase();
     order.paymentClaimedAt = new Date().toISOString();
 
-    if (tokenNumber) {
+    if (order.isGroup && Array.isArray(tokenNumbers) && tokenNumbers.length) {
+        order.members = order.members.map((m, i) => ({
+            ...m,
+            tokenNumber: tokenNumbers[i] ?? null,
+        }));
+    } else if (tokenNumber) {
         order.tokenNumber = tokenNumber;
     }
 
@@ -145,22 +270,34 @@ export async function claimPayment({ id, userId, utr, tokenNumber }) {
 }
 
 /* ---------- Admin: confirm payment received ---------- */
-export async function confirmPayment({ id, paymentNote }) {
+export async function confirmPayment({ id, paymentNote, tokenNumber, tokenNumbers }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
     if (!order) throw new Error("Order not found");
-    if (order.status !== "awaiting-verification") throw new Error("Order is not awaiting verification");
+    if (order.status !== "awaiting-verification" && order.status !== "approved") {
+        throw new Error("Order is not awaiting payment confirmation");
+    }
 
     order.status = "paid";
     order.paymentId = `PAY-${Date.now().toString(36).toUpperCase()}`;
     order.paidAt = new Date().toISOString();
     order.adminNote = String(paymentNote || order.adminNote || "").trim();
+
+    if (order.isGroup && Array.isArray(tokenNumbers) && tokenNumbers.length) {
+        order.members = order.members.map((m, i) => ({
+            ...m,
+            tokenNumber: tokenNumbers[i] ?? m.tokenNumber ?? null,
+        }));
+    } else if (tokenNumber) {
+        order.tokenNumber = tokenNumber;
+    }
+
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
     return order;
 }
 
-/* ---------- Admin: reject payment (not received) ---------- */
+/* ---------- Admin: reject payment ---------- */
 export async function rejectPayment({ id, reason }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
@@ -177,13 +314,14 @@ export async function rejectPayment({ id, reason }) {
     return order;
 }
 
-/* ---------- Admin: Start work on the order ---------- */
+/* ---------- Admin: Start work (single order) ---------- */
 export async function startWork({ id }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
     if (!order) throw new Error("Order not found");
+    if (order.isGroup) throw new Error("Use per-member start for group orders");
     if (order.status !== "paid") throw new Error("Only paid orders can start work");
-    if (order.startedAt && !order.endedAt) throw new Error("Work is already in progress for this order");
+    if (order.startedAt && !order.endedAt) throw new Error("Work is already in progress");
 
     order.status = "in-progress";
     order.startedAt = new Date().toISOString();
@@ -194,11 +332,12 @@ export async function startWork({ id }) {
     return order;
 }
 
-/* ---------- Admin: End work ---------- */
+/* ---------- Admin: End work (single order) ---------- */
 export async function endWork({ id, workNote }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
     if (!order) throw new Error("Order not found");
+    if (order.isGroup) throw new Error("Use per-member end for group orders");
     if (order.status !== "in-progress") throw new Error("Work is not in progress");
     if (!order.startedAt) throw new Error("Work was never started");
 
@@ -215,8 +354,154 @@ export async function endWork({ id, workNote }) {
     return order;
 }
 
+/* ---------- Admin: Start work for a group member ---------- */
+export async function startMemberWork({ orderId, memberId }) {
+    const orders = await loadAll();
+    const order = orders.find(o => o.id === orderId);
+    if (!order) throw new Error("Order not found");
+    if (!order.isGroup) throw new Error("Not a group order");
+    if (order.status !== "paid" && order.status !== "in-progress") {
+        throw new Error("Payment not confirmed yet");
+    }
+
+    const m = order.members.find(x => x.memberId === memberId);
+    if (!m) throw new Error("Member not found");
+    if (m.status === "in-progress") throw new Error("Member already in progress");
+    if (m.status === "completed") throw new Error("Member already completed");
+
+    m.status = "in-progress";
+    m.startedAt = new Date().toISOString();
+    m.endedAt = "";
+    m.durationSeconds = 0;
+
+    if (order.status === "paid") order.status = "in-progress";
+
+    order.updatedAt = new Date().toISOString();
+    await saveAll(orders);
+    return order;
+}
+
+/* ---------- Admin: End work for a group member ---------- */
+export async function endMemberWork({ orderId, memberId }) {
+    const orders = await loadAll();
+    const order = orders.find(o => o.id === orderId);
+    if (!order) throw new Error("Order not found");
+    if (!order.isGroup) throw new Error("Not a group order");
+
+    const m = order.members.find(x => x.memberId === memberId);
+    if (!m) throw new Error("Member not found");
+    if (m.status !== "in-progress") throw new Error("Member is not in progress");
+    if (!m.startedAt) throw new Error("Never started");
+
+    const endedAt = new Date();
+    const startedAt = new Date(m.startedAt);
+    m.status = "completed";
+    m.endedAt = endedAt.toISOString();
+    m.durationSeconds = Math.max(1, Math.round((endedAt - startedAt) / 1000));
+
+    if (order.members.every(x => x.status === "completed")) {
+        order.status = "completed";
+    }
+
+    order.updatedAt = new Date().toISOString();
+    await saveAll(orders);
+    return order;
+}
+
+/* ---------- Admin: respond to a custom order ---------- */
+export async function quoteCustomOrder({ id, action, quotedPrice, adminNote }) {
+    const orders = await loadAll();
+    const order = orders.find(o => o.id === id);
+    if (!order) throw new Error("Order not found");
+    if (order.type !== "custom") throw new Error("This is not a custom order");
+
+    order.negotiationHistory = order.negotiationHistory || [];
+
+    if (action === "accept") {
+        if (!order.suggestedPrice) throw new Error("Customer hasn't suggested a price");
+        order.negotiationHistory.push({
+            at: new Date().toISOString(), by: "admin",
+            action: "accept", price: order.suggestedPrice, note: adminNote || "",
+        });
+        order.status = "approved";
+        order.total = order.suggestedPrice;
+        order.quotedPrice = order.suggestedPrice;
+        order.adminNote = String(adminNote || "").trim();
+        order.updatedAt = new Date().toISOString();
+        await saveAll(orders);
+        return order;
+    }
+
+    if (action === "counter") {
+        const price = Number(quotedPrice);
+        if (!price || price <= 0) throw new Error("Please enter a valid price");
+        order.negotiationHistory.push({
+            at: new Date().toISOString(), by: "admin",
+            action: "counter", price, note: adminNote || "",
+        });
+        order.status = "quote-proposed";
+        order.quotedPrice = price;
+        order.adminNote = String(adminNote || "").trim();
+        order.updatedAt = new Date().toISOString();
+        await saveAll(orders);
+        return order;
+    }
+
+    if (action === "reject") {
+        order.negotiationHistory.push({
+            at: new Date().toISOString(), by: "admin",
+            action: "reject", note: adminNote || "",
+        });
+        order.status = "rejected";
+        order.adminNote = String(adminNote || "Custom request declined").trim();
+        order.updatedAt = new Date().toISOString();
+        await saveAll(orders);
+        return order;
+    }
+
+    throw new Error("Invalid action");
+}
+
+/* ---------- Customer: respond to counter-offer ---------- */
+export async function respondToQuote({ id, userId, action }) {
+    const orders = await loadAll();
+    const order = orders.find(o => o.id === id);
+    if (!order) throw new Error("Order not found");
+    if (order.userId !== userId) throw new Error("Forbidden");
+    if (order.type !== "custom") throw new Error("This is not a custom order");
+    if (order.status !== "quote-proposed") throw new Error("No active quote to respond to");
+
+    order.negotiationHistory = order.negotiationHistory || [];
+
+    if (action === "accept") {
+        order.negotiationHistory.push({
+            at: new Date().toISOString(), by: "customer",
+            action: "accept", price: order.quotedPrice,
+        });
+        order.status = "approved";
+        order.total = order.quotedPrice;
+        order.updatedAt = new Date().toISOString();
+        await saveAll(orders);
+        return order;
+    }
+
+    if (action === "decline") {
+        order.negotiationHistory.push({
+            at: new Date().toISOString(), by: "customer",
+            action: "decline", price: order.quotedPrice,
+        });
+        order.status = "custom-pending";
+        order.adminNote = "";
+        order.updatedAt = new Date().toISOString();
+        await saveAll(orders);
+        return order;
+    }
+
+    throw new Error("Invalid action");
+}
+
 /* =========================================================
-   Reports: aggregate stats
+   Reports
 ========================================================= */
 export async function buildReport({ from, to, userId, eventId }) {
     const orders = await loadAll();
@@ -277,6 +562,7 @@ export async function buildReport({ from, to, userId, eventId }) {
         }
         const stat = eventStats[o.eventId];
         if (o.tokenNumber) stat.tokensIssued += 1;
+        if (o.isGroup) stat.tokensIssued += (o.members || []).filter(m => m.tokenNumber).length;
         if (o.status === "paid" || o.status === "completed") {
             stat.paidOrders += 1;
             stat.revenue += o.total || 0;
