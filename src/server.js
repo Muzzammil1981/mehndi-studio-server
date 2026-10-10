@@ -56,6 +56,15 @@ app.use("/api/reports", reportsRoutes);
 import eventRoutes from "./routes/events.js";
 app.use("/api/events", eventRoutes);
 
+import adsRouter from "./routes/ads.js";
+import { sweepStaleRuns } from "./services/adService.js";
+
+app.use("/api/ads", adsRouter);
+// Sweep stale ad runs every 60 seconds
+setInterval(() => {
+  sweepStaleRuns().catch(err => console.error("[ads sweeper]", err?.message));
+}, 60 * 1000);
+
 initSocket(server);
 
 const PORT = process.env.PORT || 5000;

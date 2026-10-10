@@ -15,7 +15,6 @@ async function saveAll(orders) {
     await writeJson(FILE, { orders }, dataId);
 }
 
-/* ---------- Load events for name mapping ---------- */
 async function loadEventNameMap() {
     try {
         if (!isConnected()) return {};
@@ -29,8 +28,19 @@ async function loadEventNameMap() {
     }
 }
 
+/* Helper: derive money fields from raw data (safe for legacy orders) */
+function computeMoney(order) {
+    const total = Number(order.total) || 0;
+    const paidAmount = Number(order.paidAmount) || 0;
+    order.total = total;
+    order.paidAmount = paidAmount;
+    order.balanceDue = Math.max(0, total - paidAmount);
+    order.refundDue = Math.max(0, paidAmount - total);
+    return order;
+}
+
 /* =========================================================
-   CREATE ORDER (supports custom + group/family bookings)
+   CREATE ORDER
 ========================================================= */
 export async function createOrder({
     user, items, requestedDate, requestedTime, notes,
@@ -45,7 +55,6 @@ export async function createOrder({
         if (!suggestedPrice || Number(suggestedPrice) <= 0) {
             throw new Error("Please suggest a price for your custom design");
         }
-        // Custom orders made from an event page auto-fill "now" — no scheduling needed
         if (!eventId) {
             if (!requestedDate) throw new Error("Appointment date is required");
             if (!requestedTime) throw new Error("Appointment time is required");
@@ -68,7 +77,6 @@ export async function createOrder({
         if (!requestedTime) throw new Error("Appointment time is required");
     }
 
-    /* Build normalized member list */
     const memberList = isGroup && Array.isArray(members)
         ? members.map((m, i) => {
             const mItems = Array.isArray(m.items) ? m.items : [];
@@ -101,6 +109,9 @@ export async function createOrder({
         members: memberList,
         items: isGroup ? [] : (items || []),
         total,
+        paidAmount: 0,
+        balanceDue: total,
+        refundDue: 0,
         requestedDate,
         requestedTime,
         notes: String(notes || "").trim(),
@@ -140,10 +151,12 @@ export async function listOrders({ userId, role }) {
     const orders = await loadAll();
     const eventNameMap = await loadEventNameMap();
 
-    const mappedOrders = orders.map(o => ({
-        ...o,
-        eventName: o.eventId ? (eventNameMap[o.eventId] || null) : null
-    }));
+    const mappedOrders = orders.map(o => {
+        const copy = { ...o };
+        computeMoney(copy);
+        copy.eventName = o.eventId ? (eventNameMap[o.eventId] || null) : null;
+        return copy;
+    });
 
     if (role === "ADMIN") return mappedOrders;
     return mappedOrders.filter(o => o.userId === userId);
@@ -152,6 +165,8 @@ export async function listOrders({ userId, role }) {
 export async function getOrder(id) {
     const order = (await loadAll()).find(o => o.id === id) || null;
     if (!order) return null;
+
+    computeMoney(order);
 
     if (order.eventId) {
         const eventNameMap = await loadEventNameMap();
@@ -175,14 +190,12 @@ export async function updateOrderStatus({ id, status, adminNote, proposedDate, p
     order.proposedTime = proposedTime || "";
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
-    return order;
+    return computeMoney(order);
 }
 
 /* ---------- User: set payment method ---------- */
 export async function setPaymentMethod({ id, userId, method }) {
-    if (!["upi", "card", "cash"].includes(method)) {
-        throw new Error("Invalid payment method");
-    }
+    if (!["upi", "card", "cash"].includes(method)) throw new Error("Invalid payment method");
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
     if (!order) throw new Error("Order not found");
@@ -194,10 +207,17 @@ export async function setPaymentMethod({ id, userId, method }) {
     order.paymentMethod = method;
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
-    return order;
+    return computeMoney(order);
 }
 
-/* ---------- User: modify order items ---------- */
+/* =========================================================
+   User: modify order items
+   — Only charges the DIFFERENCE when the order is already paid.
+   — Handles three cases:
+       * new total > paid  → status "approved", needs top-up
+       * new total = paid  → status "paid",     no action
+       * new total < paid  → status "paid",     refund due
+========================================================= */
 export async function updateOrderItems({ id, userId, items }) {
     if (!Array.isArray(items) || items.length === 0) {
         throw new Error("Order must contain at least one design");
@@ -208,7 +228,7 @@ export async function updateOrderItems({ id, userId, items }) {
     if (order.userId !== userId) throw new Error("Forbidden");
     if (order.isGroup) throw new Error("Group orders can't be modified");
 
-    const modifiable = ["pending", "approved", "awaiting-verification"];
+    const modifiable = ["pending", "approved", "awaiting-verification", "paid"];
     if (!modifiable.includes(order.status)) {
         throw new Error("This order can no longer be modified. Please contact the studio.");
     }
@@ -219,25 +239,46 @@ export async function updateOrderItems({ id, userId, items }) {
     const previousTotal = order.total;
     const previousItems = order.items;
     const difference = newTotal - previousTotal;
+    const previousStatus = order.status;
+    const previousPaidAmount = Number(order.paidAmount) || 0;
 
     order.modifications = order.modifications || [];
     order.modifications.push({
         at: new Date().toISOString(),
         previousItems, previousTotal, newItems: items, newTotal, difference,
+        previousStatus, previousPaidAmount,
     });
 
     order.items = items;
     order.total = newTotal;
     order.previousTotal = previousTotal;
     order.totalDifference = difference;
-    order.status = order.eventId ? "approved" : "pending";
-    order.utr = "";
-    order.paymentClaimedAt = "";
-    order.paymentRejectReason = "";
-    order.updatedAt = new Date().toISOString();
+    order.paidAmount = previousPaidAmount;
+    order.balanceDue = Math.max(0, newTotal - previousPaidAmount);
+    order.refundDue = Math.max(0, previousPaidAmount - newTotal);
 
+    if (order.balanceDue > 0) {
+        // Customer still owes money — need another payment round.
+        order.status = "approved";
+        order.utr = "";
+        order.paymentClaimedAt = "";
+        order.paymentRejectReason = "";
+        // Note: we deliberately DO NOT wipe paymentId/paidAt — they record the
+        // earlier successful payment. `paidAmount` above is the source of truth.
+    } else {
+        // Fully paid (or overpaid). Session can still proceed.
+        order.status = "paid";
+        // In the refund case, clear any half-finished payment attempt so the
+        // admin doesn't see "awaiting verification" on a fully-paid order.
+        if (previousStatus === "awaiting-verification") {
+            order.utr = "";
+            order.paymentClaimedAt = "";
+        }
+    }
+
+    order.updatedAt = new Date().toISOString();
     await saveAll(orders);
-    return order;
+    return computeMoney(order);
 }
 
 /* ---------- User: claim paid (submits UTR) ---------- */
@@ -266,7 +307,7 @@ export async function claimPayment({ id, userId, utr, tokenNumber, tokenNumbers 
 
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
-    return order;
+    return computeMoney(order);
 }
 
 /* ---------- Admin: confirm payment received ---------- */
@@ -277,6 +318,17 @@ export async function confirmPayment({ id, paymentNote, tokenNumber, tokenNumber
     if (order.status !== "awaiting-verification" && order.status !== "approved") {
         throw new Error("Order is not awaiting payment confirmation");
     }
+
+    // How much is being paid right now?
+    // — If this order had already received partial payment (a top-up), it's balanceDue.
+    // — Otherwise it's the whole total.
+    const prevPaid = Number(order.paidAmount) || 0;
+    const currentBalance = Math.max(0, (order.total || 0) - prevPaid);
+    const amountPaidNow = currentBalance;
+
+    order.paidAmount = prevPaid + amountPaidNow;
+    order.balanceDue = Math.max(0, (order.total || 0) - order.paidAmount);
+    order.refundDue = Math.max(0, order.paidAmount - (order.total || 0));
 
     order.status = "paid";
     order.paymentId = `PAY-${Date.now().toString(36).toUpperCase()}`;
@@ -294,7 +346,7 @@ export async function confirmPayment({ id, paymentNote, tokenNumber, tokenNumber
 
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
-    return order;
+    return computeMoney(order);
 }
 
 /* ---------- Admin: reject payment ---------- */
@@ -304,6 +356,7 @@ export async function rejectPayment({ id, reason }) {
     if (!order) throw new Error("Order not found");
     if (order.status !== "awaiting-verification") throw new Error("Order is not awaiting verification");
 
+    // Keep paidAmount intact (nothing was actually received), just reset the pending state.
     order.status = "approved";
     order.paymentRejectReason = String(reason || "").trim();
     order.paymentRejectedAt = new Date().toISOString();
@@ -311,7 +364,43 @@ export async function rejectPayment({ id, reason }) {
     order.paymentClaimedAt = "";
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
-    return order;
+    return computeMoney(order);
+}
+
+
+export async function acknowledgeRefund({ id, note }) {
+    const orders = await loadAll();
+    const order = orders.find(o => o.id === id);
+    if (!order) throw new Error("Order not found");
+
+    // FIX: recompute money fields from paidAmount & total so we don't
+    // depend on the stored refundDue being present / correct on disk.
+    // (Legacy orders and orders modified before this field existed will
+    // have refundDue = 0 or missing on disk even though it's > 0 logically.)
+    computeMoney(order);
+
+    const refundAmount = Number(order.refundDue) || 0;
+    if (refundAmount <= 0) {
+        throw new Error("No refund is pending for this order");
+    }
+
+    order.refundHistory = order.refundHistory || [];
+    order.refundHistory.push({
+        at: new Date().toISOString(),
+        amount: refundAmount,
+        note: String(note || "").trim(),
+    });
+
+    // Reduce paidAmount by what was refunded so computeMoney() on every
+    // future read yields refundDue = 0.
+    const newPaid = Math.max(0, (Number(order.paidAmount) || 0) - refundAmount);
+    order.paidAmount = newPaid;
+    order.refundDue = 0;
+    order.refundGivenAt = new Date().toISOString();
+
+    order.updatedAt = new Date().toISOString();
+    await saveAll(orders);
+    return computeMoney(order);
 }
 
 /* ---------- Admin: Start work (single order) ---------- */
@@ -329,7 +418,7 @@ export async function startWork({ id }) {
     order.durationSeconds = 0;
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
-    return order;
+    return computeMoney(order);
 }
 
 /* ---------- Admin: End work (single order) ---------- */
@@ -351,10 +440,10 @@ export async function endWork({ id, workNote }) {
     if (workNote) order.workNote = String(workNote).trim();
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
-    return order;
+    return computeMoney(order);
 }
 
-/* ---------- Admin: Start work for a group member ---------- */
+/* ---------- Admin: group member start/end (unchanged) ---------- */
 export async function startMemberWork({ orderId, memberId }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === orderId);
@@ -378,10 +467,9 @@ export async function startMemberWork({ orderId, memberId }) {
 
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
-    return order;
+    return computeMoney(order);
 }
 
-/* ---------- Admin: End work for a group member ---------- */
 export async function endMemberWork({ orderId, memberId }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === orderId);
@@ -405,10 +493,10 @@ export async function endMemberWork({ orderId, memberId }) {
 
     order.updatedAt = new Date().toISOString();
     await saveAll(orders);
-    return order;
+    return computeMoney(order);
 }
 
-/* ---------- Admin: respond to a custom order ---------- */
+/* ---------- Custom quote flow (unchanged) ---------- */
 export async function quoteCustomOrder({ id, action, quotedPrice, adminNote }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
@@ -426,10 +514,11 @@ export async function quoteCustomOrder({ id, action, quotedPrice, adminNote }) {
         order.status = "approved";
         order.total = order.suggestedPrice;
         order.quotedPrice = order.suggestedPrice;
+        order.balanceDue = Math.max(0, order.total - (Number(order.paidAmount) || 0));
         order.adminNote = String(adminNote || "").trim();
         order.updatedAt = new Date().toISOString();
         await saveAll(orders);
-        return order;
+        return computeMoney(order);
     }
 
     if (action === "counter") {
@@ -444,7 +533,7 @@ export async function quoteCustomOrder({ id, action, quotedPrice, adminNote }) {
         order.adminNote = String(adminNote || "").trim();
         order.updatedAt = new Date().toISOString();
         await saveAll(orders);
-        return order;
+        return computeMoney(order);
     }
 
     if (action === "reject") {
@@ -456,13 +545,12 @@ export async function quoteCustomOrder({ id, action, quotedPrice, adminNote }) {
         order.adminNote = String(adminNote || "Custom request declined").trim();
         order.updatedAt = new Date().toISOString();
         await saveAll(orders);
-        return order;
+        return computeMoney(order);
     }
 
     throw new Error("Invalid action");
 }
 
-/* ---------- Customer: respond to counter-offer ---------- */
 export async function respondToQuote({ id, userId, action }) {
     const orders = await loadAll();
     const order = orders.find(o => o.id === id);
@@ -480,9 +568,10 @@ export async function respondToQuote({ id, userId, action }) {
         });
         order.status = "approved";
         order.total = order.quotedPrice;
+        order.balanceDue = Math.max(0, order.total - (Number(order.paidAmount) || 0));
         order.updatedAt = new Date().toISOString();
         await saveAll(orders);
-        return order;
+        return computeMoney(order);
     }
 
     if (action === "decline") {
@@ -494,15 +583,13 @@ export async function respondToQuote({ id, userId, action }) {
         order.adminNote = "";
         order.updatedAt = new Date().toISOString();
         await saveAll(orders);
-        return order;
+        return computeMoney(order);
     }
 
     throw new Error("Invalid action");
 }
 
-/* =========================================================
-   Reports
-========================================================= */
+/* ---------- Reports (unchanged, plus paid-aware revenue) ---------- */
 export async function buildReport({ from, to, userId, eventId }) {
     const orders = await loadAll();
 
@@ -518,7 +605,7 @@ export async function buildReport({ from, to, userId, eventId }) {
     });
 
     const revenueEligible = filtered.filter(o => o.status === "paid" || o.status === "completed");
-    const totalRevenue = revenueEligible.reduce((n, o) => n + (o.total || 0), 0);
+    const totalRevenue = revenueEligible.reduce((n, o) => n + (Number(o.paidAmount) || o.total || 0), 0);
 
     const completedSessions = filtered.filter(o => o.status === "completed" && o.durationSeconds > 0);
     const totalSeconds = completedSessions.reduce((n, o) => n + o.durationSeconds, 0);
@@ -527,7 +614,7 @@ export async function buildReport({ from, to, userId, eventId }) {
     const byDay = {};
     revenueEligible.forEach(o => {
         const day = new Date(o.paidAt || o.updatedAt || o.createdAt).toISOString().slice(0, 10);
-        byDay[day] = (byDay[day] || 0) + (o.total || 0);
+        byDay[day] = (byDay[day] || 0) + (Number(o.paidAmount) || o.total || 0);
     });
     const dailyRevenue = Object.entries(byDay)
         .map(([date, amount]) => ({ date, amount }))
@@ -538,7 +625,7 @@ export async function buildReport({ from, to, userId, eventId }) {
         const key = o.userId;
         if (!byUser[key]) byUser[key] = { userId: o.userId, username: o.username, email: o.email, count: 0, revenue: 0, totalSeconds: 0 };
         byUser[key].count += 1;
-        byUser[key].revenue += o.total || 0;
+        byUser[key].revenue += Number(o.paidAmount) || o.total || 0;
         byUser[key].totalSeconds += o.durationSeconds || 0;
     });
     const topCustomers = Object.values(byUser).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
@@ -565,7 +652,7 @@ export async function buildReport({ from, to, userId, eventId }) {
         if (o.isGroup) stat.tokensIssued += (o.members || []).filter(m => m.tokenNumber).length;
         if (o.status === "paid" || o.status === "completed") {
             stat.paidOrders += 1;
-            stat.revenue += o.total || 0;
+            stat.revenue += Number(o.paidAmount) || o.total || 0;
         }
     });
     const eventSummary = Object.values(eventStats).sort((a, b) => b.tokensIssued - a.tokensIssued);
