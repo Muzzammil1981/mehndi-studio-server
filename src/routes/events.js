@@ -280,4 +280,48 @@ router.get("/:id/queue", async (req, res) => {
     }
 });
 
+/* =========================================================
+   PATCH /api/events/:id (Admin) - Update Event Dates/Details
+========================================================= */
+router.patch("/:id", requireAuth, async (req, res) => {
+    if (!["ADMIN", "SUPERADMIN"].includes(req.user.role)) return res.status(403).json({ message: "Admin only" });
+    try {
+        const { name, startDate, endDate } = req.body || {};
+        let events = await loadEvents({ fresh: true });
+        const eventIndex = events.findIndex(e => e.id === req.params.id);
+
+        if (eventIndex === -1) return res.status(404).json({ message: "Event not found" });
+
+        const event = events[eventIndex];
+
+        // Validate and update dates if provided
+        if (startDate && endDate) {
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            if (isNaN(start.getTime()) || isNaN(end.getTime())) return res.status(400).json({ message: "Invalid dates" });
+            if (end <= start) return res.status(400).json({ message: "End date must be after start date" });
+            event.startDate = startDate;
+            event.endDate = endDate;
+        } else if (startDate) {
+            const start = new Date(startDate);
+            if (isNaN(start.getTime())) return res.status(400).json({ message: "Invalid start date" });
+            event.startDate = startDate;
+        } else if (endDate) {
+            const end = new Date(endDate);
+            if (isNaN(end.getTime())) return res.status(400).json({ message: "Invalid end date" });
+            event.endDate = endDate;
+        }
+
+        if (name !== undefined) event.name = String(name).trim();
+
+        event.updatedAt = new Date().toISOString();
+        events[eventIndex] = event;
+
+        await saveEvents(events);
+        return res.json(event);
+    } catch (err) {
+        return res.status(500).json({ message: err.message || "Failed to update event" });
+    }
+});
+
 export default router;
