@@ -180,6 +180,7 @@ export async function startRun({ id, videoId }) {
     const run = {
         id: crypto.randomUUID(),
         videoId,
+        videoTitle: v.title,              // ← NEW: freeze the title on the run record
         startedAt: new Date().toISOString(),
         endedAt: null,
         durationSeconds: 0,
